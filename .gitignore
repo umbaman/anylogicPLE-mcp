@@ -39,3 +39,8 @@ Thumbs.db
 
 # Generated output
 *.alp
+
+# Case-specific / local research artifacts (do not commit)
+*.pdf
+*_ENTREGABLE.md
+ch10_extracted.txt

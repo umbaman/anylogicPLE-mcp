@@ -4,7 +4,37 @@ Use these prompts in Claude Code after installing the MCP server and creating `.
 
 ---
 
-## Templates
+## System Dynamics
+
+### Predator-prey
+```
+Create a predator-prey SD model using template predator_prey.
+100-year horizon. Download the .alp file.
+```
+
+### Simple stock-flow
+```
+Create a simple stock-flow inventory model using template simple_stock_flow.
+60-month horizon. Download the .alp file.
+```
+
+### Custom SD model
+```
+Call anylogic_get_sd_schema first, then create an SD model "InventoryDynamics":
+- Stock Inventory (initial 500), inflow restocking rate 40/month, outflow sales 35/month
+- Time unit Month, duration 60
+- Include causal links and a TimePlot of Inventory
+Download the .alp file.
+```
+
+### Get SD schema
+```
+Show me the System Dynamics model schema for anylogic_create_sd_model_ple.
+```
+
+---
+
+## Templates (Discrete Event)
 
 ### Simple queue
 ```

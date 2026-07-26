@@ -108,5 +108,41 @@ def test_validator_usage_stats():
     assert '2/10' in result.usage['agent_types']
 
 
+def test_validator_sd_model():
+    """Test PLE validation for system dynamics models."""
+    validator = PLEValidator()
+
+    model = {
+        'paradigm': 'system_dynamics',
+        'uses_process_library': False,
+        'duration': 50,
+        'duration_hours': 50 * 24 * 365,
+        'system_dynamics': {
+            'variable_count': 25,
+            'stocks': [],
+            'flows': [],
+        },
+    }
+
+    result = validator.validate_model(model)
+    assert result.is_valid
+    assert '25/200' in result.usage['system_dynamics_vars']
+
+
+def test_validator_rejects_too_many_sd_vars():
+    """Test that validator rejects SD models exceeding variable limit."""
+    validator = PLEValidator()
+
+    model = {
+        'paradigm': 'system_dynamics',
+        'uses_process_library': False,
+        'system_dynamics': {'variable_count': 201},
+    }
+
+    result = validator.validate_model(model)
+    assert not result.is_valid
+    assert any('system dynamics variables' in e.lower() for e in result.errors)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

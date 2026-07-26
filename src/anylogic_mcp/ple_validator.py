@@ -47,6 +47,11 @@ class PLEValidator:
         warnings = []
         usage = {}
 
+        paradigm = model_definition.get('paradigm', 'discrete_event')
+
+        if paradigm == 'system_dynamics':
+            return self._validate_sd_model(model_definition)
+
         # Check agent types
         agent_types = model_definition.get('agent_types', [])
         agent_count = len(agent_types)
@@ -141,6 +146,55 @@ class PLEValidator:
             total_entities += int(arrival_rate * duration)
 
         return total_entities
+
+    def _validate_sd_model(self, model_definition: dict) -> ValidationResult:
+        errors: list[str] = []
+        warnings: list[str] = []
+        usage: dict[str, str] = {}
+
+        sd = model_definition.get('system_dynamics', {})
+        sd_var_count = sd.get('variable_count')
+        if sd_var_count is None:
+            sd_var_count = sum(
+                len(sd.get(key, []))
+                for key in (
+                    'stocks', 'flows', 'auxiliaries', 'parameters', 'table_functions'
+                )
+            )
+
+        usage['system_dynamics_vars'] = (
+            f"{sd_var_count}/{self.limits.MAX_SYSTEM_DYNAMICS_VARS}"
+        )
+        usage['agent_types'] = f"0/{self.limits.MAX_AGENT_TYPES}"
+        usage['blocks_per_agent'] = f"0/{self.limits.MAX_BLOCKS_PER_AGENT}"
+        usage['dynamic_agents'] = f"0/{self.limits.MAX_DYNAMIC_AGENTS}"
+
+        if sd_var_count > self.limits.MAX_SYSTEM_DYNAMICS_VARS:
+            errors.append(
+                f"Too many system dynamics variables: {sd_var_count} "
+                f"(PLE limit: {self.limits.MAX_SYSTEM_DYNAMICS_VARS})"
+            )
+        elif sd_var_count > self.limits.MAX_SYSTEM_DYNAMICS_VARS * 0.8:
+            warnings.append(
+                f"Approaching system dynamics variable limit: {sd_var_count}/"
+                f"{self.limits.MAX_SYSTEM_DYNAMICS_VARS}"
+            )
+
+        duration_hours = model_definition.get('duration_hours', 0)
+        if duration_hours > self.limits.MAX_SIMULATION_TIME_HOURS:
+            warnings.append(
+                f"Simulation duration (~{duration_hours:.0f} model-time hours) may exceed "
+                f"PLE's {self.limits.MAX_SIMULATION_TIME_HOURS}-hour wall-clock guidance "
+                "for non-Process-Library models at 1:1 animation speed."
+            )
+
+        is_valid = len(errors) == 0
+        return ValidationResult(
+            is_valid=is_valid,
+            errors=errors,
+            warnings=warnings,
+            usage=usage,
+        )
 
     def suggest_simplifications(self, model_definition: dict) -> List[str]:
         suggestions = []

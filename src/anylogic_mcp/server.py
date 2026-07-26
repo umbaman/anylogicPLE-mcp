@@ -3,14 +3,20 @@
 import asyncio
 import os
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from pydantic import ValidationError
 
-from .ple_validator import PLEValidator, ModelSimplifier
+from .ple_validator import PLEValidator, ModelSimplifier, PLELimits
 from .model_builder import AnyLogicModelBuilder, ModelDefinition
+from .sd_builder import SDModelBuilder
+from .sd_schema import SDModelDefinition, SDSchemaError, format_issue
+from .sd_validator import SDValidator
+from .sd_templates import build_template
 from .cloud_client import AnyLogicCloudClient
 
 
@@ -18,6 +24,8 @@ from .cloud_client import AnyLogicCloudClient
 validator = PLEValidator()
 simplifier = ModelSimplifier(validator)
 builder = AnyLogicModelBuilder()
+sd_builder = SDModelBuilder()
+sd_validator = SDValidator()
 
 # In-memory model store (keyed by UUID, valid for the lifetime of the server process)
 models_store = {}
@@ -177,6 +185,99 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="anylogic_get_sd_schema",
+            description=(
+                "Return the JSON Schema and usage notes for System Dynamics model definitions. "
+                "Use before anylogic_create_sd_model_ple to understand the explicit schema "
+                "(stocks, flows, auxiliaries, parameters with optional ui_control='slider', "
+                "table_functions, links, charts).\n\n"
+                "Example follow-up payload for anylogic_create_sd_model_ple:\n"
+                "{\n"
+                '  "name": "Inventory",\n'
+                '  "description": "Simple stock-flow",\n'
+                '  "sd_model": {\n'
+                '    "time_unit": "Month",\n'
+                '    "duration": 60,\n'
+                '    "parameters": [\n'
+                '      {"name": "restockRate", "default": "50", '
+                '"slider_min": 0, "slider_max": 100, "ui_control": "slider"}\n'
+                "    ],\n"
+                '    "stocks": [{"name": "Inventory", "initial_value": "200"}],\n'
+                '    "flows": [\n'
+                '      {"name": "restocking", "formula": "restockRate", "target": "Inventory"}\n'
+                "    ],\n"
+                '    "links": [{"source": "restockRate", "target": "restocking"}, '
+                '{"source": "restocking", "target": "Inventory"}]\n'
+                "  }\n"
+                "}"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="anylogic_create_sd_model_ple",
+            description=(
+                "Create a PLE-compliant AnyLogic System Dynamics model from an explicit schema. "
+                "Supports stocks, flows, auxiliaries, parameters (ui_control slider), "
+                "table functions (sorted X, EXTRAPOLATE/CLAMP/ERROR/CUSTOM), causal links, "
+                "and TimePlot charts. Max 200 SD variables "
+                "(stocks+flows+auxiliaries+parameters+table_functions). "
+                "Validation failures return JSON objects with error/field/suggestion. "
+                "Pure SD models do not use the Process Modeling Library; PLE applies a ~5-hour "
+                "wall-clock simulation guidance at 1:1 animation speed. "
+                "Use template for built-in models: predator_prey, simple_stock_flow.\n\n"
+                "Minimal custom example:\n"
+                "{\n"
+                '  "name": "Demo",\n'
+                '  "description": "One stock",\n'
+                '  "sd_model": {\n'
+                '    "duration": 10,\n'
+                '    "stocks": [{"name": "S", "initial_value": "1", "expression": "inflow"}],\n'
+                '    "flows": [{"name": "inflow", "formula": "1", "target": "S"}],\n'
+                '    "links": [{"source": "inflow", "target": "S"}]\n'
+                "  }\n"
+                "}"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the simulation model"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Brief description of what the model simulates"
+                    },
+                    "template": {
+                        "type": "string",
+                        "enum": [
+                            "predator_prey",
+                            "simple_stock_flow"
+                        ],
+                        "description": "Optional built-in SD template (overrides sd_model if set)"
+                    },
+                    "template_params": {
+                        "type": "object",
+                        "description": "Optional overrides for template (e.g. duration, name)"
+                    },
+                    "sd_model": {
+                        "type": "object",
+                        "description": (
+                            "Explicit System Dynamics definition. Required when template is omitted. "
+                            "Fields: time_unit, duration, stocks[], flows[], auxiliaries[], "
+                            "parameters[] (optional ui_control='slider', slider_min, slider_max), "
+                            "table_functions[], links[], charts[]. "
+                            "Call anylogic_get_sd_schema for the full JSON Schema."
+                        )
+                    }
+                },
+                "required": ["name", "description"]
+            }
         )
     ]
 
@@ -196,6 +297,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             return await download_for_ple(arguments)
         elif name == "anylogic_get_ple_limits":
             return await get_ple_limits(arguments)
+        elif name == "anylogic_get_sd_schema":
+            return await get_sd_schema(arguments)
+        elif name == "anylogic_create_sd_model_ple":
+            return await create_sd_model_ple(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -204,6 +309,104 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             type="text",
             text=f"Error executing {name}: {str(e)}"
         )]
+
+
+# ---------------------------------------------------------------------------
+# SD helpers
+# ---------------------------------------------------------------------------
+
+def _issues_from_exception(exc: BaseException) -> list[dict[str, str]]:
+    """Normalize schema/semantic failures into MCP-friendly issue dicts."""
+    if isinstance(exc, SDSchemaError):
+        return exc.to_dict_list()
+
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if isinstance(cause, SDSchemaError):
+        return cause.to_dict_list()
+
+    if isinstance(exc, ValidationError):
+        issues: list[dict[str, str]] = []
+        for err in exc.errors():
+            raw = (err.get("ctx") or {}).get("error")
+            if isinstance(raw, SDSchemaError):
+                issues.extend(raw.to_dict_list())
+                continue
+            if isinstance(raw, BaseException):
+                nested = _issues_from_exception(raw)
+                if nested and nested[0]["error"] != str(raw):
+                    issues.extend(nested)
+                    continue
+            loc = ".".join(str(x) for x in err.get("loc", ())) or "model"
+            msg = err.get("msg", str(exc))
+            # Strip pydantic's "Value error, " prefix when present
+            if msg.startswith("Value error, "):
+                msg = msg[len("Value error, "):]
+            issues.append(
+                format_issue(
+                    msg,
+                    loc,
+                    "Fix this field and call anylogic_get_sd_schema if unsure.",
+                )
+            )
+        return issues or [
+            format_issue(str(exc), "model", "Call anylogic_get_sd_schema for schema details.")
+        ]
+
+    return [
+        format_issue(
+            str(exc),
+            "model",
+            "Call anylogic_get_sd_schema for schema details.",
+        )
+    ]
+
+
+def _format_issues_block(title: str, issues: list[dict[str, str]]) -> str:
+    lines = [title]
+    for issue in issues:
+        lines.append(json.dumps(issue, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _build_model_bytes(model_data: dict) -> bytes:
+    """Build .alp bytes for a stored model (DES or SD)."""
+    model_def = model_data['definition']
+    if model_data.get('binary') is not None:
+        return model_data['binary']
+
+    paradigm = model_def.get('paradigm', 'discrete_event')
+    if paradigm == 'system_dynamics':
+        sd_data = model_def.get('system_dynamics', {})
+        sd_def = SDModelDefinition(
+            name=model_def['name'],
+            description=model_def['description'],
+            time_unit=model_def.get('time_unit', 'Year'),
+            duration=model_def.get('duration', 50),
+            stocks=sd_data.get('stocks', []),
+            flows=sd_data.get('flows', []),
+            auxiliaries=sd_data.get('auxiliaries', []),
+            parameters=sd_data.get('parameters', []),
+            table_functions=sd_data.get('table_functions', []),
+            links=sd_data.get('links', []),
+            charts=sd_data.get('charts'),
+        )
+        return sd_builder.build_model(sd_def)
+
+    if model_data['type'] == 'custom':
+        definition = ModelDefinition(
+            name=model_def['name'],
+            description=model_def['description'],
+            agent_types=model_def.get('agent_types', []),
+            duration=model_def.get('duration', 480),
+        )
+        return builder.build_model(definition)
+
+    if model_data['type'] in (
+        'predator_prey', 'simple_stock_flow'
+    ):
+        return sd_builder.build_from_template(model_data['type'], model_def)
+
+    return builder.build_from_template(model_data['type'], model_def)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +420,6 @@ async def create_model_ple(args: dict) -> list[TextContent]:
     model_name = args['name']
     model_desc = args['description']
 
-    import uuid
     model_id = str(uuid.uuid4())
 
     if model_type == 'custom':
@@ -422,17 +624,7 @@ For now, use anylogic_download_for_ple to get the .alp file without uploading to
     model_def = model_data['definition']
 
     if model_data['binary'] is None:
-        if model_data['type'] == 'custom':
-            definition = ModelDefinition(
-                name=model_def['name'],
-                description=model_def['description'],
-                agent_types=model_def.get('agent_types', []),
-                duration=model_def.get('duration', 480)
-            )
-            model_bytes = builder.build_model(definition)
-        else:
-            model_bytes = model_data['binary']
-
+        model_bytes = _build_model_bytes(model_data)
         models_store[model_id]['binary'] = model_bytes
     else:
         model_bytes = model_data['binary']
@@ -489,17 +681,7 @@ async def download_for_ple(args: dict) -> list[TextContent]:
     model_def = model_data['definition']
 
     if model_data['binary'] is None:
-        if model_data['type'] == 'custom':
-            definition = ModelDefinition(
-                name=model_def['name'],
-                description=model_def['description'],
-                agent_types=model_def.get('agent_types', []),
-                duration=model_def.get('duration', 480)
-            )
-            model_bytes = builder.build_model(definition)
-        else:
-            model_bytes = model_data['binary']
-
+        model_bytes = _build_model_bytes(model_data)
         models_store[model_id]['binary'] = model_bytes
     else:
         model_bytes = model_data['binary']
@@ -611,6 +793,171 @@ async def get_ple_limits(args: dict) -> list[TextContent]:
 """
 
     return [TextContent(type="text", text=limits_info)]
+
+
+async def get_sd_schema(args: dict) -> list[TextContent]:
+    """Return JSON Schema for System Dynamics model definitions."""
+    schema = SDModelDefinition.model_json_schema()
+    notes = """
+System Dynamics schema usage
+============================
+
+Required top-level fields when not using a template:
+  name, description, time_unit, duration, stocks, flows, links
+
+Variable types:
+  stocks[]       - {name, initial_value (numeric literal), expression?}
+  flows[]        - {name, formula, source?, target?}  (omit source/target for cloud)
+  auxiliaries[]  - {name, formula}
+  parameters[]   - {name, default, label?, slider_min?, slider_max?, ui_control?}
+                   ui_control: "slider" emits <Control Type="Slider"> linked via <Link>
+                   default must lie in [slider_min, slider_max] when range is set
+  table_functions[] - {name, points[{x,y}] (sorted unique X), interpolation?, out_of_range?}
+                   out_of_range: ERROR | EXTRAPOLATE | CUSTOM | CLAMP
+  links[]        - {source, target}  (endpoints must exist; algebraic cycles rejected)
+  charts[]       - {title, series[{title, expression, color?}]}  (series Expression2 must exist)
+
+Validations:
+  - Java-safe names [a-zA-Z_][a-zA-Z0-9_]*
+  - Duplicate names rejected
+  - Formula identifiers must reference declared variables
+  - Unused auxiliaries produce warnings
+  - Variable count = stocks+flows+auxiliaries+parameters+table_functions (max 200)
+
+Templates (pass as template=):
+  predator_prey, simple_stock_flow
+
+Example (custom with slider):
+{
+  "name": "Inventory",
+  "description": "Stock with restock slider",
+  "sd_model": {
+    "time_unit": "Month",
+    "duration": 60,
+    "parameters": [
+      {"name": "restockRate", "default": "50", "slider_min": 0, "slider_max": 100, "ui_control": "slider"}
+    ],
+    "stocks": [{"name": "Inventory", "initial_value": "200"}],
+    "flows": [{"name": "restocking", "formula": "restockRate", "target": "Inventory"}],
+    "links": [
+      {"source": "restockRate", "target": "restocking"},
+      {"source": "restocking", "target": "Inventory"}
+    ]
+  }
+}
+
+Workflow:
+  1. anylogic_get_sd_schema  (this tool)
+  2. anylogic_create_sd_model_ple
+  3. anylogic_download_for_ple(model_id=...)
+"""
+    response = json.dumps(schema, indent=2) + notes
+    return [TextContent(type="text", text=response)]
+
+
+async def create_sd_model_ple(args: dict) -> list[TextContent]:
+    """Create a PLE-compliant System Dynamics model."""
+    model_name = args['name']
+    model_desc = args['description']
+    model_id = str(uuid.uuid4())
+    template = args.get('template')
+    template_params = args.get('template_params', {})
+    template_params['name'] = model_name
+    template_params['description'] = model_desc
+
+    errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+
+    try:
+        if template:
+            sd_def = build_template(template, template_params)
+            model_type = template
+        else:
+            sd_payload = args.get('sd_model')
+            if not sd_payload:
+                issue = format_issue(
+                    "Provide either 'template' or 'sd_model'",
+                    "sd_model",
+                    "Call anylogic_get_sd_schema for the full schema, or set template="
+                    "'predator_prey'|'simple_stock_flow'.",
+                )
+                return [TextContent(
+                    type="text",
+                    text=_format_issues_block("SD Model Creation Failed", [issue]),
+                )]
+            sd_payload = {**sd_payload, 'name': model_name, 'description': model_desc}
+            sd_def = SDModelDefinition.model_validate(sd_payload)
+            model_type = 'sd_custom'
+
+        sd_semantic = sd_validator.validate(sd_def)
+        if not sd_semantic.is_valid:
+            errors.extend(sd_semantic.errors)
+        warnings.extend(sd_semantic.warnings)
+
+        model_def = sd_def.to_store_dict(model_id)
+
+        validation = validator.validate_model(model_def)
+        if not validation.is_valid:
+            for err in validation.errors:
+                errors.append(format_issue(err, "ple_limits", "Reduce model size to fit PLE limits."))
+        for warn in validation.warnings:
+            warnings.append(format_issue(warn, "ple_limits", "Consider shortening duration or simplifying."))
+
+        if errors:
+            response = f"""SD Model Creation Failed: {model_name}
+{'=' * 60}
+
+{_format_issues_block("Errors (JSON):", errors)}
+"""
+            if warnings:
+                response += "\n" + _format_issues_block("Warnings (JSON):", warnings) + "\n"
+            return [TextContent(type="text", text=response)]
+
+        model_bytes = sd_builder.build_model(sd_def)
+        models_store[model_id] = {
+            'definition': model_def,
+            'binary': model_bytes,
+            'type': model_type,
+            'paradigm': 'system_dynamics',
+        }
+
+        response_text = f"""SD Model Created: {model_name}
+{'=' * 60}
+
+Model ID: {model_id}
+Paradigm: system_dynamics
+Type: {model_type}
+Variables: {sd_def.variable_count()}/{PLELimits.MAX_SYSTEM_DYNAMICS_VARS}
+Time unit: {sd_def.time_unit}
+Duration: {sd_def.duration}
+
+PLE Compliance: PASSED
+
+Limits Usage:
+"""
+        for key, value in validation.usage.items():
+            response_text += f"  • {key.replace('_', ' ').title()}: {value}\n"
+
+        if warnings:
+            response_text += "\n" + _format_issues_block("Warnings (JSON):", warnings) + "\n"
+
+        response_text += (
+            f"\nThis model is ready for AnyLogic PLE.\n\nNext steps:\n"
+            f"  1. Download: anylogic_download_for_ple(model_id='{model_id}')\n"
+            f"  2. Open the .alp file in AnyLogic PLE 8.9.x and click Run\n"
+        )
+        return [TextContent(type="text", text=response_text)]
+
+    except Exception as e:
+        issues = _issues_from_exception(e)
+        return [TextContent(
+            type="text",
+            text=(
+                f"SD model validation failed: {model_name}\n"
+                f"{'=' * 60}\n\n"
+                f"{_format_issues_block('Errors (JSON):', issues)}\n"
+            ),
+        )]
 
 
 async def _main():
